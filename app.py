@@ -8,7 +8,7 @@ import bcrypt
 # -----------------------------
 # CONFIG
 # -----------------------------
-APP_TITLE = "PsyCare (Secure Suggestion Demo)"
+APP_TITLE = "PsyCare (Your personal End-to-End Secure Suggestion System)"
 DB_PATH = "psycare.db"
 
 # Caesar shift per weekday (step of 2)
@@ -315,9 +315,8 @@ def render_admin_portal(conn, current_user):
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="centered")
     st.title(APP_TITLE)
-    st.write("This demo routes user messages to a psychologist agent, generates an "
-             "UPPERCASE suggestion (150–200 chars), encrypts it with a weekday-based Caesar shift, "
-             "and returns the encrypted text to the user.")
+    st.write("This system routes user messages to a psychologist agent, generates a suggestion"
+             "and returns it back to the user, due to some bug in the system the cipher text is not decrypted for the user, we are sorry for the inconvenience, It will be resovled soon.")
 
     conn = get_db()
     bootstrap_admin(conn)
