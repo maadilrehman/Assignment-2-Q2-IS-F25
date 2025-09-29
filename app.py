@@ -14,22 +14,17 @@ from math import gcd
 APP_TITLE = "PsyCare (Secure Suggestion Demo)"
 DB_PATH = "psycare.db"
 
-# Weekday -> additive key b for Affine cipher (a fixed below)
+# Weekday -> additive key b for Affine cipher
 WEEKDAY_B = {
     "MONDAY": 2, "TUESDAY": 4, "WEDNESDAY": 6, "THURSDAY": 8,
     "FRIDAY": 10, "SATURDAY": 12, "SUNDAY": 14,
 }
-
-# Affine cipher parameters (E(x) = (a*x + b) mod 26)
-AFFINE_A = 9  # gcd(9, 26) == 1 -> valid
-# b is dynamic per weekday via WEEKDAY_B
 
 # Admin bootstrap (override via env if desired)
 ADMIN_USERNAME = os.getenv("PSY_ADMIN_USER", "psychologist")
 ADMIN_PASSWORD = os.getenv("PSY_ADMIN_PASS", "admin123")  # hashed on first run
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
 
 # -----------------------------
 # DB HELPERS
@@ -49,6 +44,8 @@ def get_db():
         user_id INTEGER NOT NULL,
         username TEXT NOT NULL,
         weekday TEXT NOT NULL,
+        a_param INTEGER NOT NULL,
+        b_param INTEGER NOT NULL,
         user_message TEXT NOT NULL,
         llm_suggestion_plain TEXT NOT NULL,
         suggestion_encrypted TEXT NOT NULL,
@@ -87,14 +84,23 @@ def get_user(conn, username):
         return None
     return {"id": row[0], "username": row[1], "password_hash": row[2], "role": row[3]}
 
-
 # -----------------------------
 # CRYPTO (AFFINE)
 # -----------------------------
+def next_coprime_after(b: int, modulus: int = 26) -> int:
+    """
+    Return the smallest integer a such that a > b and gcd(a, modulus) == 1.
+    For modulus 26, valid a are odd and not 13 mod 26.
+    """
+    a = b + 1
+    while gcd(a, modulus) != 1:
+        a += 1
+    return a
+
 def affine_encrypt_char(ch: str, a: int, b: int) -> str:
     """
-    Encrypt a single uppercase letter with Affine cipher: E(x) = (a*x + b) mod 26
-    Spaces are preserved; non A–Z stripped by caller.
+    Affine encryption of single uppercase char: E(x) = (a*x + b) mod 26
+    Spaces pass through; all other chars should have been stripped prior.
     """
     if ch == " ":
         return " "
@@ -104,11 +110,9 @@ def affine_encrypt_char(ch: str, a: int, b: int) -> str:
         return chr(y + ord('A'))
     return ""
 
-
 def affine_encrypt(text: str, a: int, b: int) -> str:
     text = text.upper()
     return "".join(affine_encrypt_char(c, a, b) for c in text if c == " " or c in ALPHABET)
-
 
 # -----------------------------
 # SMALL LOCAL "LLM" + SANITIZER
@@ -128,11 +132,10 @@ def load_small_llm():
     except Exception:
         return None, None
 
-
 def sanitize_upper_space_len(text: str) -> str:
     """
     Enforce: only A–Z and spaces, length between 500–600 characters (inclusive).
-    Pads or trims with neutral supportive phrases.
+    Pads or trims with neutral supportive phrases to stay within bounds.
     """
     text = text.upper()
     text = re.sub(r"[^A-Z ]", " ", text)
@@ -157,7 +160,6 @@ def sanitize_upper_space_len(text: str) -> str:
         if len(text) > MAX_LEN:
             text = text[:MAX_LEN].rstrip()
     return text
-
 
 def tiny_llm_generate(prompt_text: str) -> str:
     """
@@ -191,9 +193,9 @@ def tiny_llm_generate(prompt_text: str) -> str:
             text = tok.decode(out[0], skip_special_tokens=True)
             return sanitize_upper_space_len(text)
         except Exception:
-            pass  # fall through to template generator
+            pass  # fallback below
 
-    # --- Fallback: natural-ish varied template (uppercase + spaces enforced later) ---
+    # Fallback: natural-ish varied template (uppercase + spaces enforced later)
     actions = [
         "TAKE TEN SLOW BREATHS WHILE YOU RELAX YOUR JAW AND SHOULDERS",
         "WRITE ONE SENTENCE ABOUT WHAT YOU NEED AND ONE TINY STEP YOU CAN TAKE",
@@ -230,7 +232,6 @@ def tiny_llm_generate(prompt_text: str) -> str:
     text = " ".join(paragraphs)
     return sanitize_upper_space_len(text)
 
-
 # -----------------------------
 # UI HELPERS
 # -----------------------------
@@ -246,8 +247,8 @@ def login_box(conn):
             st.error("Invalid credentials.")
             return None
         st.success(f"Welcome, {user['username']}!")
-    return get_user(conn, username.strip()) if submit else None
-
+        return {"id": user["id"], "username": user["username"], "role": user["role"]}
+    return None
 
 def signup_box(conn):
     st.subheader("Sign up")
@@ -272,7 +273,6 @@ def signup_box(conn):
         except sqlite3.IntegrityError:
             st.error("Username already exists.")
 
-
 def render_user_portal(conn, current_user):
     st.header("User Portal")
     st.caption("Share your case details. You will receive a secure response.")
@@ -286,16 +286,23 @@ def render_user_portal(conn, current_user):
             st.warning("Please enter your message.")
             return
 
+        # Generate plaintext suggestion
         suggestion_plain = tiny_llm_generate(case_text)
-        b = WEEKDAY_B[weekday]
-        suggestion_cipher = affine_encrypt(suggestion_plain, AFFINE_A, b)
 
+        # Affine parameters: b from weekday, a is smallest coprime > b
+        b = WEEKDAY_B[weekday]
+        a = next_coprime_after(b, 26)
+
+        # Encrypt
+        suggestion_cipher = affine_encrypt(suggestion_plain, a, b)
+
+        # Persist
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO messages(user_id, username, weekday, user_message, llm_suggestion_plain, suggestion_encrypted, created_at)
-            VALUES(?,?,?,?,?,?,?)
+            INSERT INTO messages(user_id, username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
         """, (
-            current_user["id"], current_user["username"], weekday, case_text.strip(),
+            current_user["id"], current_user["username"], weekday, a, b, case_text.strip(),
             suggestion_plain, suggestion_cipher, datetime.utcnow().isoformat()
         ))
         conn.commit()
@@ -308,21 +315,19 @@ def render_user_portal(conn, current_user):
     st.subheader("Your History")
     cur = conn.cursor()
     cur.execute("""
-        SELECT weekday, user_message, suggestion_encrypted, created_at
+        SELECT weekday, suggestion_encrypted, created_at
         FROM messages WHERE user_id = ?
         ORDER BY id DESC LIMIT 50
     """, (current_user["id"],))
     rows = cur.fetchall()
     if rows:
-        for wd, umsg, enc, ts in rows:
+        for wd, enc, ts in rows:
             st.markdown(f"**{wd.title()}** — {ts}")
-            st.write(umsg)
             wrapped = "\n".join(enc[i:i+80] for i in range(0, len(enc), 80))
             st.code(wrapped, language="text")
             st.markdown("---")
     else:
         st.info("No messages yet.")
-
 
 def render_admin_portal(conn, current_user):
     st.header("Admin Portal — Psychologist")
@@ -332,12 +337,12 @@ def render_admin_portal(conn, current_user):
     cur = conn.cursor()
     if who:
         cur.execute("""
-            SELECT username, weekday, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
+            SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
             FROM messages WHERE username = ? ORDER BY id DESC
         """, (who,))
     else:
         cur.execute("""
-            SELECT username, weekday, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
+            SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
             FROM messages ORDER BY id DESC
         """)
 
@@ -346,7 +351,7 @@ def render_admin_portal(conn, current_user):
         st.info("No messages yet.")
         return
 
-    for uname, wd, msg, plain, enc, ts in rows:
+    for uname, wd, a, b, msg, plain, enc, ts in rows:
         st.markdown(f"**{uname}** • {wd.title()} • {ts}")
         c1, c2 = st.columns(2)
         with c1:
@@ -359,8 +364,8 @@ def render_admin_portal(conn, current_user):
             st.markdown("**Suggestion (Plaintext for Admin)**")
             wrapped_plain = "\n".join(plain[i:i+80] for i in range(0, len(plain), 80))
             st.code(wrapped_plain, language="text")
+            st.caption(f"AFFINE PARAMS USED → a = {a}, b = {b}")
         st.markdown("---")
-
 
 # -----------------------------
 # APP
@@ -371,7 +376,7 @@ def main():
     st.write(
         "This demo generates a PRACTICAL SUGGESTION with a tiny local model, "
         "sanitizes it to UPPERCASE AND SPACES, constrains it to 500–600 CHARS, then "
-        "encrypts it using an AFFINE CIPHER where a = 9 and b depends on the weekday."
+        "encrypts it using an AFFINE CIPHER where b depends on the weekday and a is the next coprime greater than b."
     )
 
     conn = get_db()
@@ -406,8 +411,5 @@ def main():
     else:
         render_user_portal(conn, st.session_state.user)
 
-
 if __name__ == "__main__":
-    # sanity check: ensure affine 'a' is valid mod 26
-    assert gcd(AFFINE_A, 26) == 1, "Affine parameter 'a' must be coprime with 26."
     main()
