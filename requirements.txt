@@ -1,3 +1,6 @@
 streamlit>=1.36
 bcrypt>=4.1
-openai>=1.40  # optional; app works without OPENAI_API_KEY
+transformers>=4.43
+torch>=2.2
+sentencepiece>=0.1.99
+safetensors>=0.4.2
