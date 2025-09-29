@@ -6,6 +6,7 @@ import streamlit as st
 import bcrypt
 import secrets
 import random
+from math import gcd
 
 # -----------------------------
 # CONFIG
@@ -13,15 +14,22 @@ import random
 APP_TITLE = "PsyCare (Secure Suggestion Demo)"
 DB_PATH = "psycare.db"
 
-WEEKDAY_KEY = {
+# Weekday -> additive key b for Affine cipher (a fixed below)
+WEEKDAY_B = {
     "MONDAY": 2, "TUESDAY": 4, "WEDNESDAY": 6, "THURSDAY": 8,
     "FRIDAY": 10, "SATURDAY": 12, "SUNDAY": 14,
 }
 
+# Affine cipher parameters (E(x) = (a*x + b) mod 26)
+AFFINE_A = 9  # gcd(9, 26) == 1 -> valid
+# b is dynamic per weekday via WEEKDAY_B
+
+# Admin bootstrap (override via env if desired)
 ADMIN_USERNAME = os.getenv("PSY_ADMIN_USER", "psychologist")
 ADMIN_PASSWORD = os.getenv("PSY_ADMIN_PASS", "admin123")  # hashed on first run
 
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
 
 # -----------------------------
 # DB HELPERS
@@ -50,6 +58,7 @@ def get_db():
     conn.commit()
     return conn
 
+
 def bootstrap_admin(conn):
     cur = conn.cursor()
     cur.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,))
@@ -61,6 +70,7 @@ def bootstrap_admin(conn):
         )
         conn.commit()
 
+
 def create_user(conn, username, password, role="USER"):
     cur = conn.cursor()
     pw_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
@@ -68,33 +78,47 @@ def create_user(conn, username, password, role="USER"):
                 (username, pw_hash, role))
     conn.commit()
 
+
 def get_user(conn, username):
     cur = conn.cursor()
     cur.execute("SELECT id, username, password_hash, role FROM users WHERE username = ?", (username,))
     row = cur.fetchone()
-    if not row: return None
+    if not row:
+        return None
     return {"id": row[0], "username": row[1], "password_hash": row[2], "role": row[3]}
 
+
 # -----------------------------
-# CRYPTO (CAESAR)
+# CRYPTO (AFFINE)
 # -----------------------------
-def caesar_shift_char(ch, k):
+def affine_encrypt_char(ch: str, a: int, b: int) -> str:
+    """
+    Encrypt a single uppercase letter with Affine cipher: E(x) = (a*x + b) mod 26
+    Spaces are preserved; non A–Z stripped by caller.
+    """
     if ch == " ":
         return " "
     if ch in ALPHABET:
-        idx = (ALPHABET.index(ch) + k) % 26
-        return ALPHABET[idx]
+        x = ord(ch) - ord('A')
+        y = (a * x + b) % 26
+        return chr(y + ord('A'))
     return ""
 
-def caesar_encrypt(text, k):
+
+def affine_encrypt(text: str, a: int, b: int) -> str:
     text = text.upper()
-    return "".join(caesar_shift_char(c, k) for c in text)
+    return "".join(affine_encrypt_char(c, a, b) for c in text if c == " " or c in ALPHABET)
+
 
 # -----------------------------
-# LOCAL “SMALL LLM” GENERATOR (FLAN-T5-SMALL) + SANITIZER
+# SMALL LOCAL "LLM" + SANITIZER
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_small_llm():
+    """
+    Load a tiny instruction-tuned model (CPU OK). Cached across reruns.
+    If loading fails, caller falls back to a template generator.
+    """
     try:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         model_name = os.getenv("SMALL_LLM_NAME", "google/flan-t5-small")
@@ -104,84 +128,108 @@ def load_small_llm():
     except Exception:
         return None, None
 
+
 def sanitize_upper_space_len(text: str) -> str:
+    """
+    Enforce: only A–Z and spaces, length between 500–600 characters (inclusive).
+    Pads or trims with neutral supportive phrases.
+    """
     text = text.upper()
     text = re.sub(r"[^A-Z ]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > 200:
-        text = text[:200].rstrip()
-    if len(text) < 150:
-        # deterministic padding that still reads natural-ish
-        pad = " BREATHE IN BREATHE OUT NOTICE YOUR BODY AND SOFTEN YOUR SHOULDERS "
-        while len(text) < 150:
-            text += pad
+
+    MAX_LEN, MIN_LEN = 600, 500
+    if len(text) > MAX_LEN:
+        text = text[:MAX_LEN].rstrip()
+
+    if len(text) < MIN_LEN:
+        pad_bank = [
+            " BREATHE IN BREATHE OUT NOTICE YOUR BODY AND SOFTEN YOUR SHOULDERS ",
+            " YOU ARE SAFE RIGHT NOW CHOOSE ONE KIND SMALL STEP AND HONOR YOUR LIMITS ",
+            " PROGRESS HAPPENS IN QUIET MOMENTS KEEP YOUR PACE STEADY AND COMPASSIONATE ",
+            " RETURN TO YOUR BREATH AND NAME WHAT YOU FEEL WITHOUT JUDGMENT THEN LET IT PASS "
+        ]
+        i = 0
+        while len(text) < MIN_LEN:
+            text += pad_bank[i % len(pad_bank)]
             text = re.sub(r"\s+", " ", text).strip()
-        if len(text) > 200:
-            text = text[:200].rstrip()
+            i += 1
+        if len(text) > MAX_LEN:
+            text = text[:MAX_LEN].rstrip()
     return text
+
 
 def tiny_llm_generate(prompt_text: str) -> str:
     """
-    Try flan-t5-small on CPU with sampling; sanitize and enforce length.
-    Fallback to template generator if model unavailable.
+    Try flan-t5-small to generate a supportive response aimed at ~550 chars (pre-sanitize).
+    Falls back to a varied template if model unavailable.
     """
     tok, mdl = load_small_llm()
     seed = int.from_bytes(secrets.token_bytes(4), "big")
     rnd = random.Random(seed)
 
     sys_hint = (
-        "You are a concise psychologist. Write a supportive, practical suggestion "
-        "for the case below in 1-2 sentences, ~180 characters. Avoid lists. "
-        "Keep it simple and warm."
+        "You are a concise psychologist. Write a supportive and practical suggestion "
+        "for the case below in 5–8 short sentences, about 550 characters total. "
+        "Avoid lists, keep language simple, warm, and actionable."
     )
     user_case = re.sub(r"\s+", " ", prompt_text).strip()
     inp = f"{sys_hint}\nCASE: {user_case}"
 
     if tok and mdl:
         try:
-            ids = tok(inp, return_tensors="pt", truncation=True, max_length=256).input_ids
+            ids = tok(inp, return_tensors="pt", truncation=True, max_length=640).input_ids
             out = mdl.generate(
                 ids,
                 do_sample=True,
                 top_p=0.9,
                 temperature=0.8,
-                max_new_tokens=120,
+                max_new_tokens=420,
                 repetition_penalty=1.1,
                 no_repeat_ngram_size=3,
             )
             text = tok.decode(out[0], skip_special_tokens=True)
             return sanitize_upper_space_len(text)
         except Exception:
-            pass
+            pass  # fall through to template generator
 
-    # --- Fallback: varied template generator (still natural-ish) ---
+    # --- Fallback: natural-ish varied template (uppercase + spaces enforced later) ---
     actions = [
-        "TAKE TEN SLOW BREATHS AND NAME WHAT YOU FEEL",
-        "WRITE ONE CLEAR SENTENCE ABOUT YOUR NEEDS",
-        "PLAN A TINY STEP YOU CAN DO TODAY",
-        "RELAX YOUR JAW NECK AND SHOULDERS",
-        "STEP OUTSIDE FOR TWO MINUTES OF AIR",
-        "SILENCE NOTIFICATIONS FOR A SHORT WHILE",
+        "TAKE TEN SLOW BREATHS WHILE YOU RELAX YOUR JAW AND SHOULDERS",
+        "WRITE ONE SENTENCE ABOUT WHAT YOU NEED AND ONE TINY STEP YOU CAN TAKE",
+        "DRINK WATER AND EAT SOMETHING STEADY TO SUPPORT YOUR ENERGY",
+        "WALK OUTSIDE BRIEFLY AND COUNT YOUR STEPS TO GROUND YOUR ATTENTION",
+        "SILENCE NOTIFICATIONS FOR A SHORT WINDOW TO CREATE QUIET SPACE",
+        "PLACE A HAND ON YOUR CHEST AND MATCH YOUR INHALE AND EXHALE GENTLY",
+        "NOTICE THREE THINGS YOU SEE AND TWO THINGS YOU HEAR AND ONE THING YOU FEEL"
     ]
     reframes = [
-        "PROGRESS HAPPENS IN SMALL HONEST MOVES",
-        "YOUR FEELINGS MAKE SENSE AND WILL EASE",
-        "YOU CAN ASK FOR HELP BEFORE IT FEELS URGENT",
-        "REST IS PART OF HEALING NOT FAILURE",
-        "CURIOSITY BEATS SELF JUDGMENT",
+        "FEELINGS SURGE AND FADE YOU CAN RIDE THE WAVE SAFELY",
+        "REST IS PART OF HEALING NOT A FAILURE OF WILLPOWER",
+        "SMALL CONSISTENT ACTIONS BEAT PERFECT PLANS THAT NEVER START",
+        "YOUR EXPERIENCE MAKES SENSE GIVEN YOUR CONTEXT SHOW YOURSELF KINDNESS",
+        "YOU CAN ASK FOR HELP EARLY BEFORE IT FEELS OVERWHELMING",
+        "PROGRESS ARRIVES THROUGH PATIENCE AND GENTLE PRACTICE EACH DAY"
     ]
     supports = [
-        "MESSAGE A TRUSTED PERSON FOR GENTLE SUPPORT",
-        "SCHEDULE A BRIEF CHECK IN WITH YOUR THERAPIST",
-        "SET ONE KIND BOUNDARY AND KEEP IT SIMPLE",
-        "DRINK WATER AND EAT SOMETHING STEADY",
+        "MESSAGE A TRUSTED PERSON FOR A BRIEF CHECK IN",
+        "NOTE ONE QUESTION TO BRING TO YOUR NEXT SESSION",
+        "SET A SIMPLE BOUNDARY USING CLEAR AND KIND WORDS",
+        "CREATE A CALM EVENING ROUTINE AND PROTECT YOUR WIND DOWN TIME",
+        "PLAN A SHORT WALK OR STRETCH TO LOOSEN TENSION"
     ]
     cue = re.sub(r"[^A-Za-z ]+", " ", prompt_text).upper().strip()
-    cue = "REGARDING " + " ".join(cue.split()[:5]) if cue else "FOCUS ON KIND ACTION"
-    parts = [cue, rnd.choice(actions), rnd.choice(reframes), rnd.choice(supports)]
-    rnd.shuffle(parts)
-    text = " ".join(parts)
+    cue = "REGARDING " + " ".join(cue.split()[:12]) if cue else "FOCUS ON STEADY KIND ACTIONS"
+
+    paragraphs = [
+        f"{cue} {rnd.choice(actions)} {rnd.choice(reframes)}",
+        f"{rnd.choice(actions)} {rnd.choice(supports)} {rnd.choice(reframes)}",
+        f"{rnd.choice(supports)} {rnd.choice(actions)} {rnd.choice(reframes)}"
+    ]
+    rnd.shuffle(paragraphs)
+    text = " ".join(paragraphs)
     return sanitize_upper_space_len(text)
+
 
 # -----------------------------
 # UI HELPERS
@@ -198,8 +246,8 @@ def login_box(conn):
             st.error("Invalid credentials.")
             return None
         st.success(f"Welcome, {user['username']}!")
-        return {"id": user["id"], "username": user["username"], "role": user["role"]}
-    return None
+    return get_user(conn, username.strip()) if submit else None
+
 
 def signup_box(conn):
     st.subheader("Sign up")
@@ -224,11 +272,12 @@ def signup_box(conn):
         except sqlite3.IntegrityError:
             st.error("Username already exists.")
 
+
 def render_user_portal(conn, current_user):
     st.header("User Portal")
     st.caption("Share your case details. You will receive a secure response.")
 
-    weekdays = ["MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY","SATURDAY","SUNDAY"]
+    weekdays = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
     weekday = st.selectbox("Select weekday", weekdays, index=0)
     case_text = st.text_area("Your message (case details)")
 
@@ -238,8 +287,8 @@ def render_user_portal(conn, current_user):
             return
 
         suggestion_plain = tiny_llm_generate(case_text)
-        key = WEEKDAY_KEY[weekday]
-        suggestion_cipher = caesar_encrypt(suggestion_plain, key)
+        b = WEEKDAY_B[weekday]
+        suggestion_cipher = affine_encrypt(suggestion_plain, AFFINE_A, b)
 
         cur = conn.cursor()
         cur.execute("""
@@ -252,7 +301,8 @@ def render_user_portal(conn, current_user):
         conn.commit()
 
         st.success("Encrypted suggestion received.")
-        st.code(suggestion_cipher, language="text")  # encrypted only
+        wrapped = "\n".join(suggestion_cipher[i:i+80] for i in range(0, len(suggestion_cipher), 80))
+        st.code(wrapped, language="text")  # encrypted only
 
     st.divider()
     st.subheader("Your History")
@@ -267,10 +317,12 @@ def render_user_portal(conn, current_user):
         for wd, umsg, enc, ts in rows:
             st.markdown(f"**{wd.title()}** — {ts}")
             st.write(umsg)
-            st.code(enc, language="text")
+            wrapped = "\n".join(enc[i:i+80] for i in range(0, len(enc), 80))
+            st.code(wrapped, language="text")
             st.markdown("---")
     else:
         st.info("No messages yet.")
+
 
 def render_admin_portal(conn, current_user):
     st.header("Admin Portal — Psychologist")
@@ -301,11 +353,14 @@ def render_admin_portal(conn, current_user):
             st.markdown("**User Message**")
             st.write(msg)
             st.markdown("**Encrypted Sent to User**")
-            st.code(enc, language="text")
+            wrapped = "\n".join(enc[i:i+80] for i in range(0, len(enc), 80))
+            st.code(wrapped, language="text")
         with c2:
             st.markdown("**Suggestion (Plaintext for Admin)**")
-            st.code(plain, language="text")
+            wrapped_plain = "\n".join(plain[i:i+80] for i in range(0, len(plain), 80))
+            st.code(wrapped_plain, language="text")
         st.markdown("---")
+
 
 # -----------------------------
 # APP
@@ -314,9 +369,9 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="centered")
     st.title(APP_TITLE)
     st.write(
-        "This demo generates a SHORT, PRACTICAL SUGGESTION with a tiny local model, "
-        "sanitizes it to UPPERCASE AND SPACES, constrains it to 150–200 CHARS, then "
-        "encrypts it per weekday before returning to the user."
+        "This demo generates a PRACTICAL SUGGESTION with a tiny local model, "
+        "sanitizes it to UPPERCASE AND SPACES, constrains it to 500–600 CHARS, then "
+        "encrypts it using an AFFINE CIPHER where a = 9 and b depends on the weekday."
     )
 
     conn = get_db()
@@ -351,5 +406,8 @@ def main():
     else:
         render_user_portal(conn, st.session_state.user)
 
+
 if __name__ == "__main__":
+    # sanity check: ensure affine 'a' is valid mod 26
+    assert gcd(AFFINE_A, 26) == 1, "Affine parameter 'a' must be coprime with 26."
     main()
