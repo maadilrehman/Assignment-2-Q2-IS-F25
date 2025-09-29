@@ -344,10 +344,7 @@ def main():
                 signup_box(conn)
 
         st.divider()
-        st.markdown("**Weekday → Caesar Key**")
-        st.markdown(
-            "MON: 2  •  TUE: 4  •  WED: 6  •  THU: 8  •  FRI: 10  •  SAT: 12  •  SUN: 14"
-        )
+       
 
     # Main panels
     if not st.session_state.user:
