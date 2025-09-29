@@ -243,9 +243,9 @@ def render_user_portal(conn, current_user):
         st.code(suggestion_cipher, language="text")
 
         # Optional local self-check (not returned to admin): allow user to decrypt to verify correctness
-        with st.expander("Decrypt locally to verify (client-side)"):
-            st.caption(f"Uses the weekday key = {key}")
-            st.code(caesar_decrypt(suggestion_cipher, key), language="text")
+        #with st.expander("Decrypt locally to verify (client-side)"):
+        #    st.caption(f"Uses the weekday key = {key}")
+        #    st.code(caesar_decrypt(suggestion_cipher, key), language="text")
 
     st.divider()
     st.subheader("Your History")
