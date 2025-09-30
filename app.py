@@ -90,7 +90,7 @@ def get_user(conn, username):
 def next_coprime_after(b: int, modulus: int = 26) -> int:
     """
     Return the smallest integer a such that a > b and gcd(a, modulus) == 1.
-    For modulus 26, valid a are odd and not 13 mod 26.
+    For modulus 26, valid a are odd and not divisible by 13.
     """
     a = b + 1
     while gcd(a, modulus) != 1:
@@ -98,10 +98,6 @@ def next_coprime_after(b: int, modulus: int = 26) -> int:
     return a
 
 def affine_encrypt_char(ch: str, a: int, b: int) -> str:
-    """
-    Affine encryption of single uppercase char: E(x) = (a*x + b) mod 26
-    Spaces pass through; all other chars should have been stripped prior.
-    """
     if ch == " ":
         return " "
     if ch in ALPHABET:
@@ -115,14 +111,10 @@ def affine_encrypt(text: str, a: int, b: int) -> str:
     return "".join(affine_encrypt_char(c, a, b) for c in text if c == " " or c in ALPHABET)
 
 # -----------------------------
-# SMALL LOCAL "LLM" + SANITIZER
+# SMALL LOCAL "LLM" (raw English, just uppercase at end)
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_small_llm():
-    """
-    Load a tiny instruction-tuned model (CPU OK). Cached across reruns.
-    If loading fails, caller falls back to a template generator.
-    """
     try:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
         model_name = os.getenv("SMALL_LLM_NAME", "google/flan-t5-small")
@@ -132,39 +124,10 @@ def load_small_llm():
     except Exception:
         return None, None
 
-def sanitize_upper_space_len(text: str) -> str:
-    """
-    Enforce: only A–Z and spaces, length between 500–600 characters (inclusive).
-    Pads or trims with neutral supportive phrases to stay within bounds.
-    """
-    text = text.upper()
-    text = re.sub(r"[^A-Z ]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    MAX_LEN, MIN_LEN = 600, 500
-    if len(text) > MAX_LEN:
-        text = text[:MAX_LEN].rstrip()
-
-    if len(text) < MIN_LEN:
-        pad_bank = [
-            " BREATHE IN BREATHE OUT NOTICE YOUR BODY AND SOFTEN YOUR SHOULDERS ",
-            " YOU ARE SAFE RIGHT NOW CHOOSE ONE KIND SMALL STEP AND HONOR YOUR LIMITS ",
-            " PROGRESS HAPPENS IN QUIET MOMENTS KEEP YOUR PACE STEADY AND COMPASSIONATE ",
-            " RETURN TO YOUR BREATH AND NAME WHAT YOU FEEL WITHOUT JUDGMENT THEN LET IT PASS "
-        ]
-        i = 0
-        while len(text) < MIN_LEN:
-            text += pad_bank[i % len(pad_bank)]
-            text = re.sub(r"\s+", " ", text).strip()
-            i += 1
-        if len(text) > MAX_LEN:
-            text = text[:MAX_LEN].rstrip()
-    return text
-
 def tiny_llm_generate(prompt_text: str) -> str:
     """
-    Try flan-t5-small to generate a supportive response aimed at ~550 chars (pre-sanitize).
-    Falls back to a varied template if model unavailable.
+    Generate supportive text ~550 characters.
+    Keep natural English, only uppercase at the very end.
     """
     tok, mdl = load_small_llm()
     seed = int.from_bytes(secrets.token_bytes(4), "big")
@@ -191,46 +154,26 @@ def tiny_llm_generate(prompt_text: str) -> str:
                 no_repeat_ngram_size=3,
             )
             text = tok.decode(out[0], skip_special_tokens=True)
-            return sanitize_upper_space_len(text)
+            return text.upper()
         except Exception:
-            pass  # fallback below
+            pass
 
-    # Fallback: natural-ish varied template (uppercase + spaces enforced later)
-    actions = [
-        "TAKE TEN SLOW BREATHS WHILE YOU RELAX YOUR JAW AND SHOULDERS",
-        "WRITE ONE SENTENCE ABOUT WHAT YOU NEED AND ONE TINY STEP YOU CAN TAKE",
-        "DRINK WATER AND EAT SOMETHING STEADY TO SUPPORT YOUR ENERGY",
-        "WALK OUTSIDE BRIEFLY AND COUNT YOUR STEPS TO GROUND YOUR ATTENTION",
-        "SILENCE NOTIFICATIONS FOR A SHORT WINDOW TO CREATE QUIET SPACE",
-        "PLACE A HAND ON YOUR CHEST AND MATCH YOUR INHALE AND EXHALE GENTLY",
-        "NOTICE THREE THINGS YOU SEE AND TWO THINGS YOU HEAR AND ONE THING YOU FEEL"
-    ]
-    reframes = [
-        "FEELINGS SURGE AND FADE YOU CAN RIDE THE WAVE SAFELY",
-        "REST IS PART OF HEALING NOT A FAILURE OF WILLPOWER",
-        "SMALL CONSISTENT ACTIONS BEAT PERFECT PLANS THAT NEVER START",
-        "YOUR EXPERIENCE MAKES SENSE GIVEN YOUR CONTEXT SHOW YOURSELF KINDNESS",
-        "YOU CAN ASK FOR HELP EARLY BEFORE IT FEELS OVERWHELMING",
-        "PROGRESS ARRIVES THROUGH PATIENCE AND GENTLE PRACTICE EACH DAY"
-    ]
-    supports = [
-        "MESSAGE A TRUSTED PERSON FOR A BRIEF CHECK IN",
-        "NOTE ONE QUESTION TO BRING TO YOUR NEXT SESSION",
-        "SET A SIMPLE BOUNDARY USING CLEAR AND KIND WORDS",
-        "CREATE A CALM EVENING ROUTINE AND PROTECT YOUR WIND DOWN TIME",
-        "PLAN A SHORT WALK OR STRETCH TO LOOSEN TENSION"
-    ]
-    cue = re.sub(r"[^A-Za-z ]+", " ", prompt_text).upper().strip()
-    cue = "REGARDING " + " ".join(cue.split()[:12]) if cue else "FOCUS ON STEADY KIND ACTIONS"
+    # Fallback templates
+    templates = [
+        "Take a few minutes to breathe slowly and notice how your body feels. "
+        "Give yourself permission to pause. Progress does not need to be perfect. "
+        "Reach out to a trusted friend if the day feels heavy. Rest is also action.",
 
-    paragraphs = [
-        f"{cue} {rnd.choice(actions)} {rnd.choice(reframes)}",
-        f"{rnd.choice(actions)} {rnd.choice(supports)} {rnd.choice(reframes)}",
-        f"{rnd.choice(supports)} {rnd.choice(actions)} {rnd.choice(reframes)}"
+        "When your mind races, gently write down what worries you. "
+        "Break it into one small step you can try today. "
+        "Your feelings are valid, but they do not define your worth. "
+        "You are allowed to ask for support.",
+
+        "Step outside for a moment of fresh air and let your senses ground you. "
+        "Notice three things you see, two things you hear, one thing you feel. "
+        "Healing often begins with small choices repeated with patience."
     ]
-    rnd.shuffle(paragraphs)
-    text = " ".join(paragraphs)
-    return sanitize_upper_space_len(text)
+    return rnd.choice(templates).upper()
 
 # -----------------------------
 # UI HELPERS
@@ -277,7 +220,7 @@ def render_user_portal(conn, current_user):
     st.header("User Portal")
     st.caption("Share your case details. You will receive a secure response.")
 
-    weekdays = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY"]
+    weekdays = list(WEEKDAY_B.keys())
     weekday = st.selectbox("Select weekday", weekdays, index=0)
     case_text = st.text_area("Your message (case details)")
 
@@ -286,17 +229,11 @@ def render_user_portal(conn, current_user):
             st.warning("Please enter your message.")
             return
 
-        # Generate plaintext suggestion
         suggestion_plain = tiny_llm_generate(case_text)
-
-        # Affine parameters: b from weekday, a is smallest coprime > b
         b = WEEKDAY_B[weekday]
         a = next_coprime_after(b, 26)
-
-        # Encrypt
         suggestion_cipher = affine_encrypt(suggestion_plain, a, b)
 
-        # Persist
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO messages(user_id, username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at)
@@ -309,7 +246,7 @@ def render_user_portal(conn, current_user):
 
         st.success("Encrypted suggestion received.")
         wrapped = "\n".join(suggestion_cipher[i:i+80] for i in range(0, len(suggestion_cipher), 80))
-        st.code(wrapped, language="text")  # encrypted only
+        st.code(wrapped, language="text")
 
     st.divider()
     st.subheader("Your History")
@@ -333,19 +270,11 @@ def render_admin_portal(conn, current_user):
     st.header("Admin Portal — Psychologist")
     st.caption("View incoming cases and plaintext suggestions (user sees only the encrypted text).")
 
-    who = st.text_input("Filter by username (optional)").strip()
     cur = conn.cursor()
-    if who:
-        cur.execute("""
-            SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
-            FROM messages WHERE username = ? ORDER BY id DESC
-        """, (who,))
-    else:
-        cur.execute("""
-            SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
-            FROM messages ORDER BY id DESC
-        """)
-
+    cur.execute("""
+        SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
+        FROM messages ORDER BY id DESC
+    """)
     rows = cur.fetchall()
     if not rows:
         st.info("No messages yet.")
@@ -375,8 +304,9 @@ def main():
     st.title(APP_TITLE)
     st.write(
         "This demo generates a PRACTICAL SUGGESTION with a tiny local model, "
-        "sanitizes it to UPPERCASE AND SPACES, constrains it to 500–600 CHARS, then "
-        "encrypts it using an AFFINE CIPHER where b depends on the weekday and a is the next coprime greater than b."
+        "keeps it in ENGLISH but forces ALL CAPS, length ~500–600 chars naturally, "
+        "then encrypts it using an AFFINE CIPHER where b depends on the weekday "
+        "and a is the next coprime greater than b."
     )
 
     conn = get_db()
