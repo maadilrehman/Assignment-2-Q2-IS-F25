@@ -11,7 +11,7 @@ from math import gcd
 # -----------------------------
 # CONFIG
 # -----------------------------
-APP_TITLE = "PsyCare (Your personal End-to-End Secure Psychologist)"
+APP_TITLE = "PsyCare (Secure Suggestion Demo)"
 DB_PATH = "psycare.db"
 
 # Weekday -> additive key b for Affine cipher
@@ -27,12 +27,12 @@ ADMIN_PASSWORD = os.getenv("PSY_ADMIN_PASS", "admin123")  # hashed on first run
 ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # -----------------------------
-# DB HELPERS
+# DB HELPERS (with migration)
 # -----------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 
-    # Create tables if they don't exist (initial schema)
+    # Base tables
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,7 +46,6 @@ def get_db():
         user_id INTEGER NOT NULL,
         username TEXT NOT NULL,
         weekday TEXT NOT NULL,
-        -- newer columns (might not exist on older DBs; we add them below if missing)
         a_param INTEGER,
         b_param INTEGER,
         user_message TEXT NOT NULL,
@@ -57,34 +56,29 @@ def get_db():
     )""")
     conn.commit()
 
-    # --- MIGRATION: add any missing columns on older DB files ---
+    # Migration: ensure a_param, b_param exist (older DBs)
     def col_missing(table, col):
         cur = conn.execute(f"PRAGMA table_info({table})")
         return col.upper() not in {row[1].upper() for row in cur.fetchall()}
 
-    # messages.a_param / messages.b_param were added later
     if col_missing("messages", "a_param"):
         conn.execute("ALTER TABLE messages ADD COLUMN a_param INTEGER")
     if col_missing("messages", "b_param"):
         conn.execute("ALTER TABLE messages ADD COLUMN b_param INTEGER")
+    conn.commit()
 
-    # Optional: backfill NULLs for existing rows (choose sensible defaults)
-    # Here we set a_param=b_param+1 if null and coprime to 26; otherwise 5.
+    # Backfill any NULL a/b
     cur = conn.cursor()
     cur.execute("SELECT id, b_param FROM messages WHERE a_param IS NULL OR b_param IS NULL")
     rows = cur.fetchall()
-    from math import gcd
     for mid, b in rows:
         if b is None:
-            b = 2  # safe default
-        a = b + 1
-        while gcd(a, 26) != 1:
-            a += 1
+            b = 2
+        a = next_coprime_after(b, 26)
         conn.execute("UPDATE messages SET a_param=?, b_param=? WHERE id=?", (a, b, mid))
-
     conn.commit()
-    return conn
 
+    return conn
 
 
 def bootstrap_admin(conn):
@@ -119,10 +113,7 @@ def get_user(conn, username):
 # CRYPTO (AFFINE)
 # -----------------------------
 def next_coprime_after(b: int, modulus: int = 26) -> int:
-    """
-    Return the smallest integer a such that a > b and gcd(a, modulus) == 1.
-    For modulus 26, valid a are odd and not divisible by 13.
-    """
+    """Smallest integer a such that a > b and gcd(a, modulus) == 1."""
     a = b + 1
     while gcd(a, modulus) != 1:
         a += 1
@@ -138,11 +129,25 @@ def affine_encrypt_char(ch: str, a: int, b: int) -> str:
     return ""
 
 def affine_encrypt(text: str, a: int, b: int) -> str:
+    # Cipher operates on A–Z and spaces only; everything else is dropped
     text = text.upper()
     return "".join(affine_encrypt_char(c, a, b) for c in text if c == " " or c in ALPHABET)
 
+# Helpers to reason about ciphertext length before encrypting
+def letters_spaces_only_upper(s: str) -> str:
+    """Uppercase and keep only A–Z and spaces (mirrors affine_encrypt filter)."""
+    s = s.upper()
+    return "".join(ch for ch in s if ch == " " or ("A" <= ch <= "Z"))
+
+def trim_to_word_boundary(s: str, max_chars: int) -> str:
+    """Trim string s (already UPPER) to <= max_chars at a space if possible."""
+    if len(s) <= max_chars:
+        return s
+    cut = s.rfind(" ", 0, max_chars + 1)
+    return s[: (cut if cut != -1 else max_chars)].rstrip()
+
 # -----------------------------
-# SMALL LOCAL "LLM" (raw English, just uppercase at end)
+# SMALL LOCAL "LLM" (natural English, only uppercasing at end)
 # -----------------------------
 @st.cache_resource(show_spinner=False)
 def load_small_llm():
@@ -155,56 +160,80 @@ def load_small_llm():
     except Exception:
         return None, None
 
-def tiny_llm_generate(prompt_text: str) -> str:
+def tiny_llm_generate_length_aware(prompt_text: str, min_cipher_chars: int = 500, max_cipher_chars: int = 700) -> str:
     """
-    Generate supportive text ~550 characters.
-    Keep natural English, only uppercase at the very end.
+    Generate supportive text (~550 chars target) in natural English, then UPPERCASE,
+    ensuring that the final ciphertext length (A–Z + spaces only) falls within [min,max].
+    Achieved by optional short continuations or word-boundary trimming before encryption.
     """
     tok, mdl = load_small_llm()
     seed = int.from_bytes(secrets.token_bytes(4), "big")
     rnd = random.Random(seed)
 
-    sys_hint = (
-        "You are a concise psychologist. Write a supportive and practical suggestion "
-        "for the case below in 5–8 short sentences, about 550 characters total. "
-        "Avoid lists, keep language simple, warm, and actionable."
-    )
-    user_case = re.sub(r"\s+", " ", prompt_text).strip()
-    inp = f"{sys_hint}\nCASE: {user_case}"
+    def gen_once(context: str) -> str:
+        sys_hint = (
+            "You are a concise psychologist. Write a supportive and practical suggestion "
+            "for the case below in 4–8 short sentences. Avoid lists. Keep it warm and actionable."
+        )
+        user_case = re.sub(r"\s+", " ", context).strip()
+        inp = f"{sys_hint}\nCASE: {user_case}"
+        if tok and mdl:
+            try:
+                ids = tok(inp, return_tensors="pt", truncation=True, max_length=640).input_ids
+                out = mdl.generate(
+                    ids,
+                    do_sample=True,
+                    top_p=0.9,
+                    temperature=0.8,
+                    max_new_tokens=360,
+                    repetition_penalty=1.1,
+                    no_repeat_ngram_size=3,
+                )
+                return tok.decode(out[0], skip_special_tokens=True)
+            except Exception:
+                pass
+        # Fallback natural templates (English sentences)
+        templates = [
+            "Take a few minutes to breathe slowly and notice how your body feels. "
+            "Give yourself permission to pause. Progress does not need to be perfect. "
+            "Reach out to a trusted friend if the day feels heavy. Rest is also action.",
+            "When your mind races, gently write down what worries you. "
+            "Break it into one small step you can try today. "
+            "Your feelings are valid, but they do not define your worth. "
+            "You are allowed to ask for support.",
+            "Step outside for a moment of fresh air and let your senses ground you. "
+            "Notice three things you see, two things you hear, one thing you feel. "
+            "Healing often begins with small choices repeated with patience."
+        ]
+        return rnd.choice(templates)
 
-    if tok and mdl:
-        try:
-            ids = tok(inp, return_tensors="pt", truncation=True, max_length=640).input_ids
-            out = mdl.generate(
-                ids,
-                do_sample=True,
-                top_p=0.9,
-                temperature=0.8,
-                max_new_tokens=420,
-                repetition_penalty=1.1,
-                no_repeat_ngram_size=3,
-            )
-            text = tok.decode(out[0], skip_special_tokens=True)
-            return text.upper()
-        except Exception:
-            pass
+    # initial text
+    text = gen_once(prompt_text)
 
-    # Fallback templates
-    templates = [
-        "Take a few minutes to breathe slowly and notice how your body feels. "
-        "Give yourself permission to pause. Progress does not need to be perfect. "
-        "Reach out to a trusted friend if the day feels heavy. Rest is also action.",
+    # try to hit the cipher-length band via continuations
+    ATTEMPTS = 3
+    for _ in range(ATTEMPTS + 1):
+        caps = text.upper()
+        filtered = letters_spaces_only_upper(caps)
+        if len(filtered) > max_cipher_chars:
+            # trim at word boundary, then ensure under max after filtering
+            caps_trimmed = trim_to_word_boundary(caps, max_cipher_chars + 20)
+            filtered = letters_spaces_only_upper(caps_trimmed)
+            while len(filtered) > max_cipher_chars and len(caps_trimmed) > 0:
+                caps_trimmed = caps_trimmed[:-1]
+                filtered = letters_spaces_only_upper(caps_trimmed)
+            return caps_trimmed
+        if len(filtered) >= min_cipher_chars:
+            return caps
 
-        "When your mind races, gently write down what worries you. "
-        "Break it into one small step you can try today. "
-        "Your feelings are valid, but they do not define your worth. "
-        "You are allowed to ask for support.",
+        # too short → generate a short continuation and append
+        cont_prompt = f"{text}\nContinue with two brief, supportive sentences that build on the same tone."
+        continuation = gen_once(cont_prompt)
+        text = (text.rstrip() + " " + continuation.lstrip()).strip()
 
-        "Step outside for a moment of fresh air and let your senses ground you. "
-        "Notice three things you see, two things you hear, one thing you feel. "
-        "Healing often begins with small choices repeated with patience."
-    ]
-    return rnd.choice(templates).upper()
+    # last resort: nudge with one brief sentence
+    tail = " Keep your plans simple and gentle for now."
+    return (text + tail).upper()
 
 # -----------------------------
 # UI HELPERS
@@ -260,11 +289,17 @@ def render_user_portal(conn, current_user):
             st.warning("Please enter your message.")
             return
 
-        suggestion_plain = tiny_llm_generate(case_text)
+        # Generate plaintext (ALL CAPS) with ciphertext length targeting 500–700
+        suggestion_plain = tiny_llm_generate_length_aware(case_text, min_cipher_chars=500, max_cipher_chars=700)
+
+        # Affine parameters: b from weekday, a is smallest coprime > b
         b = WEEKDAY_B[weekday]
         a = next_coprime_after(b, 26)
+
+        # Encrypt
         suggestion_cipher = affine_encrypt(suggestion_plain, a, b)
 
+        # Persist
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO messages(user_id, username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at)
@@ -301,11 +336,19 @@ def render_admin_portal(conn, current_user):
     st.header("Admin Portal — Psychologist")
     st.caption("View incoming cases and plaintext suggestions (user sees only the encrypted text).")
 
+    who = st.text_input("Filter by username (optional)").strip()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
-        FROM messages ORDER BY id DESC
-    """)
+    if who:
+        cur.execute("""
+            SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
+            FROM messages WHERE username = ? ORDER BY id DESC
+        """, (who,))
+    else:
+        cur.execute("""
+            SELECT username, weekday, a_param, b_param, user_message, llm_suggestion_plain, suggestion_encrypted, created_at
+            FROM messages ORDER BY id DESC
+        """)
+
     rows = cur.fetchall()
     if not rows:
         st.info("No messages yet.")
@@ -320,11 +363,12 @@ def render_admin_portal(conn, current_user):
             st.markdown("**Encrypted Sent to User**")
             wrapped = "\n".join(enc[i:i+80] for i in range(0, len(enc), 80))
             st.code(wrapped, language="text")
+            st.caption(f"Ciphertext length: {len(enc)} chars")
         with c2:
-            st.markdown("**Suggestion (Plaintext for Admin)**")
+            st.markdown("**Suggestion (Plaintext for Admin, ALL CAPS)**")
             wrapped_plain = "\n".join(plain[i:i+80] for i in range(0, len(plain), 80))
             st.code(wrapped_plain, language="text")
-            st.caption(f"AFFINE PARAMS USED → a = {a}, b = {b}")
+            st.caption(f"AFFINE PARAMS → a = {a}, b = {b}")
         st.markdown("---")
 
 # -----------------------------
@@ -334,7 +378,10 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="centered")
     st.title(APP_TITLE)
     st.write(
-        "This system routes user messages to a psychologist agent, generates a suggestionand returns it back to the user, due to some bug in the system the cipher text is not decrypted for the user, we are sorry for the inconvenience, It will be resovled soon."
+        "Generates a supportive suggestion with a tiny local model (then ALL CAPS), "
+        "ensures the *ciphertext* length is between 500–700 characters, and encrypts with an "
+        "AFFINE CIPHER where b depends on the weekday and a is the next coprime greater than b. "
+        "Users see only the ciphertext; admins can audit plaintext and parameters."
     )
 
     conn = get_db()
