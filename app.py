@@ -31,6 +31,8 @@ ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 # -----------------------------
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+    # Create tables if they don't exist (initial schema)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,8 +46,9 @@ def get_db():
         user_id INTEGER NOT NULL,
         username TEXT NOT NULL,
         weekday TEXT NOT NULL,
-        a_param INTEGER NOT NULL,
-        b_param INTEGER NOT NULL,
+        -- newer columns (might not exist on older DBs; we add them below if missing)
+        a_param INTEGER,
+        b_param INTEGER,
         user_message TEXT NOT NULL,
         llm_suggestion_plain TEXT NOT NULL,
         suggestion_encrypted TEXT NOT NULL,
@@ -53,7 +56,35 @@ def get_db():
         FOREIGN KEY(user_id) REFERENCES users(id)
     )""")
     conn.commit()
+
+    # --- MIGRATION: add any missing columns on older DB files ---
+    def col_missing(table, col):
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        return col.upper() not in {row[1].upper() for row in cur.fetchall()}
+
+    # messages.a_param / messages.b_param were added later
+    if col_missing("messages", "a_param"):
+        conn.execute("ALTER TABLE messages ADD COLUMN a_param INTEGER")
+    if col_missing("messages", "b_param"):
+        conn.execute("ALTER TABLE messages ADD COLUMN b_param INTEGER")
+
+    # Optional: backfill NULLs for existing rows (choose sensible defaults)
+    # Here we set a_param=b_param+1 if null and coprime to 26; otherwise 5.
+    cur = conn.cursor()
+    cur.execute("SELECT id, b_param FROM messages WHERE a_param IS NULL OR b_param IS NULL")
+    rows = cur.fetchall()
+    from math import gcd
+    for mid, b in rows:
+        if b is None:
+            b = 2  # safe default
+        a = b + 1
+        while gcd(a, 26) != 1:
+            a += 1
+        conn.execute("UPDATE messages SET a_param=?, b_param=? WHERE id=?", (a, b, mid))
+
+    conn.commit()
     return conn
+
 
 
 def bootstrap_admin(conn):
