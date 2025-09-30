@@ -378,7 +378,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="centered")
     st.title(APP_TITLE)
     st.write(
-        "This system routes user messages to a psychologist agent, generates a suggestionand returns it back to the user, due to some bug in the system the cipher text is not decrypted for the user, we are sorry for the inconvenience, It will be resovled soon."
+        "This system routes user messages to a psychologist agent, generates a suggestion and returns it back to the user, due to some bug in the system the cipher text is not decrypted for the user, we are sorry for the inconvenience, It will be resovled soon."
     )
 
     conn = get_db()
