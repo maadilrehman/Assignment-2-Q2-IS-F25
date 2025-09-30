@@ -326,8 +326,8 @@ def render_user_portal(conn, current_user):
     if rows:
         for um, wd, enc, ts in rows:
             st.markdown(f"**{wd.title()}** — {ts}\n")
-            st.markdown(f"**Your Message:** {um}")
-            wrapped = "\n**Suggestion:** ".join(enc[i:i+80] for i in range(0, len(enc), 80))
+            st.markdown(f"**Your Message:** {um}\n **Suggestion:**")
+            wrapped = "\n ".join(enc[i:i+80] for i in range(0, len(enc), 80))
             st.code(wrapped, language="text")
             st.markdown("---")
     else:
