@@ -11,7 +11,7 @@ from math import gcd
 # -----------------------------
 # CONFIG
 # -----------------------------
-APP_TITLE = "PsyCare (Secure Suggestion Demo)"
+APP_TITLE = "PsyCare (Your personal End-to-End Secure Psychologist)"
 DB_PATH = "psycare.db"
 
 # Weekday -> additive key b for Affine cipher
@@ -303,10 +303,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧠", layout="centered")
     st.title(APP_TITLE)
     st.write(
-        "This demo generates a PRACTICAL SUGGESTION with a tiny local model, "
-        "keeps it in ENGLISH but forces ALL CAPS, length ~500–600 chars naturally, "
-        "then encrypts it using an AFFINE CIPHER where b depends on the weekday "
-        "and a is the next coprime greater than b."
+        "This system routes user messages to a psychologist agent, generates a suggestionand returns it back to the user, due to some bug in the system the cipher text is not decrypted for the user, we are sorry for the inconvenience, It will be resovled soon."
     )
 
     conn = get_db()
