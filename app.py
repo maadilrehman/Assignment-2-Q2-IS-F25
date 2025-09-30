@@ -318,15 +318,16 @@ def render_user_portal(conn, current_user):
     st.subheader("Your History")
     cur = conn.cursor()
     cur.execute("""
-        SELECT weekday, suggestion_encrypted, created_at
+        SELECT user_message, weekday, suggestion_encrypted, created_at
         FROM messages WHERE user_id = ?
         ORDER BY id DESC LIMIT 50
     """, (current_user["id"],))
     rows = cur.fetchall()
     if rows:
-        for wd, enc, ts in rows:
-            st.markdown(f"**{wd.title()}** — {ts}")
-            wrapped = "\n".join(enc[i:i+80] for i in range(0, len(enc), 80))
+        for um, wd, enc, ts in rows:
+            st.markdown(f"**{wd.title()}** — {ts}\n")
+            st.markdown(f"**Your Message:** {um}")
+            wrapped = "\n**Suggestion:** ".join(enc[i:i+80] for i in range(0, len(enc), 80))
             st.code(wrapped, language="text")
             st.markdown("---")
     else:
